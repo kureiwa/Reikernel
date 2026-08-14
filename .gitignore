@@ -1,0 +1,32 @@
+# Reikernel build artifacts
+build/
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# bench results are generated; keep the dir but ignore JSON
+bench/results/*.json
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# secrets
+.env
+.env.*
+
+# vendor/EoSD build outputs (we vendor the source, not the .o/.a)
+vendor/EoSD/**/build/
+vendor/EoSD/**/src/*.o
+vendor/EoSD/**/src/*.a
+vendor/EoSD/tests/extreme/test_*_extreme
+vendor/EoSD/example/build/
+vendor/EoSD/tools/crashdump
