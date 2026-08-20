@@ -30,6 +30,31 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O3 -march=native -fopenmp -fPIC
 LDFLAGS ?= -shared -fopenmp
 
+# rk.mm backend selection.
+#
+#   RK_MM_BACKEND=blis  (default): hand-tiled AVX-512 BLIS microkernel.
+#   RK_MM_BACKEND=cblas:           thin wrapper around cblas_sgemm.
+#
+# When cblas is selected, RK_BLAS_LIB names the BLAS shared object to
+# link against. The default is mkl_rt (Intel oneAPI MKL single-thread
+# runtime); override to openblas or blas on systems without MKL:
+#
+#   make RK_MM_BACKEND=cblas RK_BLAS_LIB=blas
+#
+# Adding the cblas path defines -DRK_MM_CBLAS in CFLAGS and appends
+# -l$(RK_BLAS_LIB) to RK_BLAS_LIBS, which is placed after the object
+# files in the link line so the linker resolves the cblas_sgemm
+# reference from the correct archive. The blis path is unchanged so
+# `make` with no arguments keeps building the hand-tiled kernel.
+RK_MM_BACKEND ?= blis
+RK_BLAS_LIB   ?= mkl_rt
+RK_BLAS_LIBS  ?=
+
+ifeq ($(RK_MM_BACKEND),cblas)
+CFLAGS       += -DRK_MM_CBLAS
+RK_BLAS_LIBS += -l$(RK_BLAS_LIB)
+endif
+
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 VENDOR_DIR    := $(REPO_ROOT)/vendor/EoSD
 BUILD_DIR     := $(REPO_ROOT)/build
@@ -85,7 +110,7 @@ $(BUILD_DIR)/%.o: $(C_SRC_DIR)/%.c | $(BUILD_DIR) $(BARRAGE_LIB) $(TOPO_LIB)
 # so no extra -l flags are needed; libbarrage is the same.
 $(LIB_PATH): $(C_OBJECTS) $(BARRAGE_LIB) $(TOPO_LIB) | $(BUILD_DIR)
 	@echo "  LD  $@"
-	@$(CC) $(LDFLAGS) -o $@ $(C_OBJECTS) $(BARRAGE_LIB) $(TOPO_LIB) -lm
+	@$(CC) $(LDFLAGS) -o $@ $(C_OBJECTS) $(BARRAGE_LIB) $(TOPO_LIB) -lm $(RK_BLAS_LIBS)
 	@echo "Built $(LIB_PATH)"
 
 test: $(LIB_PATH)

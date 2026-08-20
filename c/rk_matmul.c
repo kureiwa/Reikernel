@@ -1,8 +1,19 @@
 /* rk_matmul.c -- FP32 matmul C = A @ B.
- * BLIS-style MC=64/KC=256/NC=128 blocking with MR=8/NR=16 AVX-512 FMA
- * microkernel. OpenMP collapse(2) over (MC,NC). Per-thread 32 MiB
- * libbarrage arena for packed panels. Math matches torch.mm within
- * atol=1e-5 (FP32 FMA, no -ffast-math, no reciprocal tricks).
+ *
+ * Two backends selectable at compile time via -DRK_MM_CBLAS:
+ *
+ *   default (blis): BLIS-style MC=64/KC=256/NC=128 blocking with
+ *                   MR=8/NR=16 AVX-512 FMA microkernel. OpenMP
+ *                   collapse(2) over (MC,NC). Per-thread 32 MiB
+ *                   libbarrage arena for packed panels.
+ *   cblas:          thin wrapper around cblas_sgemm (MKL / OpenBLAS /
+ *                   netlib BLAS). Lets the BLAS vendor manage its own
+ *                   threading and scratch, eliminating the hand-tiled
+ *                   pack/microkernel path. Bit-exact with torch.mm when
+ *                   PyTorch links the same BLAS.
+ *
+ * Math matches torch.mm within atol=1e-5 (FP32 FMA, no -ffast-math,
+ * no reciprocal tricks).
  */
 
 #include "rk_api.h"
@@ -11,6 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+#ifdef RK_MM_CBLAS
+#include <cblas.h>
+#endif
 
 #include "barrage.h"
 
@@ -172,6 +187,23 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
     if ((int64_t)K * (int64_t)N > (int64_t)INT32_MAX) return -1;
     if ((int64_t)M * (int64_t)N > (int64_t)INT32_MAX) return -1;
 
+#ifdef RK_MM_CBLAS
+    /* cblas_sgemm path. The BLAS vendor manages threading and scratch
+     * internally; we just pass row-major A (M x K, ld=K) and B (K x N,
+     * ld=N) and let it write C (M x N, ld=N). beta=0 means C is
+     * overwritten, matching the blis path's memset+add behaviour and
+     * torch.mm's semantics (not torch.addmm).
+     *
+     * The blis helpers (rk_get_thread_arena, rk_microkernel, rk_pack_A,
+     * rk_pack_B) are compiled but unused in this path; reference the
+     * arena helper to silence -Wunused-function. */
+    (void)rk_get_thread_arena;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                (const int)M, (const int)N, (const int)K,
+                1.0f, A, (const int)K, B, (const int)N,
+                0.0f, C, (const int)N);
+    return 0;
+#else
     /* Zero C so the always-add microkernel computes C = A@B (not C += A@B).
      * For K=0 this is the only work and the output is correctly all zeros. */
     memset(C, 0, (size_t)M * (size_t)N * sizeof(float));
@@ -271,4 +303,5 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
     }
 
     return 0;
+#endif  /* RK_MM_CBLAS */
 }

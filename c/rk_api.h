@@ -14,10 +14,18 @@ int rk_rms_norm(const float *x, const float *weight, float *y,
                 int B, int T, int C, float eps);
 
 /* rk_mm: C = A @ B, FP32 matmul (drop-in for torch.mm).
- * A shape (M,K), B shape (K,N), C shape (M,N). BLIS-style
- * MC=64/KC=256/NC=128 blocking, MR=8/NR=16 AVX-512 FMA microkernel,
- * OpenMP collapse(2) over (MC,NC). Per-thread libbarrage arena for
- * packed panels. Tail handling zero-pads rows/cols.
+ * A shape (M,K), B shape (K,N), C shape (M,N). Two compile-time backends:
+ *
+ *   default (blis): BLIS-style MC=64/KC=256/NC=128 blocking,
+ *                   MR=8/NR=16 AVX-512 FMA microkernel, OpenMP
+ *                   collapse(2) over (MC,NC). Per-thread libbarrage
+ *                   arena for packed panels. Tail handling zero-pads
+ *                   rows/cols.
+ *   cblas:          selected by -DRK_MM_CBLAS. Calls cblas_sgemm
+ *                   (MKL / OpenBLAS / netlib BLAS); the BLAS vendor
+ *                   manages threading and scratch. Bit-exact with
+ *                   torch.mm when PyTorch links the same BLAS.
+ *
  * Returns 0 on success, -1 on bad input. */
 int rk_mm(const float *A, const float *B, float *C, int M, int K, int N);
 
