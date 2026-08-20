@@ -55,16 +55,26 @@ static barrage_arena_t *rk_get_thread_arena(void)
     return arena;
 }
 
-/* MR x NR FP32 microkernel. 8 zmm accumulators, AVX-512 FMA inner loop.
- * Loads existing C, adds the partial sum, stores back so multiple kc-steps
- * accumulate into the same C tile. */
-static inline void rk_microkernel(
+/* MR x NR FP32 microkernel body. FMAs kc iterations of A_pack x B_pack
+ * into 8 local zmm accumulators (zeroed per call), then adds the local
+ * sum into the persistent accumulators at accs[0..7] with a separate
+ * _mm512_add_ps. The separate add (rather than FMA-into-accs directly)
+ * preserves the baseline's FP rounding: each kc-step produces a
+ * FMA-reduced partial sum, and the cross-kc accumulation is a plain
+ * add. That keeps rk.mm bit-exact with torch.mm for K <= KC and within
+ * atol=1e-5 for K > KC, matching the pre-restructure math.
+ *
+ * The caller zeroes accs before the first kc-step (equivalent to
+ * loading C since rk_mm memsets C to 0) and stores accs to C once after
+ * the last kc-step. This keeps the 8 zmm accumulators alive across all
+ * kc-steps for a given (ii, jj) micro-tile, eliminating the per-kc-step
+ * C load+add+store round-trip that the old always-store microkernel did. */
+static inline void rk_microkernel_body(
     int kc,
     const float *RK_RESTRICT A_pack,
     const float *RK_RESTRICT B_pack,
     int ldb,
-    float *RK_RESTRICT C, int ldc,
-    int ii, int jj, int M, int N)
+    __m512 *RK_RESTRICT accs)
 {
     __m512 c0 = _mm512_setzero_ps();
     __m512 c1 = _mm512_setzero_ps();
@@ -89,9 +99,27 @@ static inline void rk_microkernel(
         c7 = _mm512_fmadd_ps(_mm512_set1_ps(A_pack[7 * kc + k]), b, c7);
     }
 
-    /* Store with M- and N-tail handling. Load existing C, add partial sum,
-     * store back so multiple kc-steps accumulate into the same C tile.
-     * C was memset to 0 in rk_mm, so the first kc-step's load reads 0. */
+    /* Cross-kc accumulation as a separate add (not fused with FMA).
+     * Matches the baseline's `C = old_C + partial_sum` rounding. */
+    accs[0] = _mm512_add_ps(accs[0], c0);
+    accs[1] = _mm512_add_ps(accs[1], c1);
+    accs[2] = _mm512_add_ps(accs[2], c2);
+    accs[3] = _mm512_add_ps(accs[3], c3);
+    accs[4] = _mm512_add_ps(accs[4], c4);
+    accs[5] = _mm512_add_ps(accs[5], c5);
+    accs[6] = _mm512_add_ps(accs[6], c6);
+    accs[7] = _mm512_add_ps(accs[7], c7);
+}
+
+/* Store 8 zmm accumulators (one MR-row of NR lanes each) to a MR x NR
+ * tile of C. M-tail skips rows past M; N-tail uses a mask to write only
+ * the valid lanes. Called once per (ii, jj) micro-tile after all kc-steps
+ * have run. */
+static inline void rk_microkernel_store(
+    const __m512 *RK_RESTRICT accs,
+    float *RK_RESTRICT C, int ldc,
+    int ii, int jj, int M, int N)
+{
     const int m_tile = (ii + MR <= M) ? MR : (M - ii);
     const int n_tile = (jj + NR <= N) ? NR : (N - jj);
     const __mmask16 nmask = (n_tile == NR)
@@ -102,32 +130,19 @@ static inline void rk_microkernel(
     do {                                                                   \
         if (i < m_tile) {                                                  \
             float *crow = C + (size_t)(ii + i) * ldc + jj;                 \
-            __m512 old = _mm512_maskz_loadu_ps(nmask, crow);               \
-            __m512 sum = _mm512_add_ps(old, c##i);                        \
-            _mm512_mask_storeu_ps(crow, nmask, sum);                       \
+            _mm512_mask_storeu_ps(crow, nmask, accs[i]);                   \
         }                                                                  \
     } while (0)
 
     /* Same code path for full-width and N-tail; nmask handles the difference. */
-    if (n_tile == NR) {
-        RK_STORE_ROW(0);
-        RK_STORE_ROW(1);
-        RK_STORE_ROW(2);
-        RK_STORE_ROW(3);
-        RK_STORE_ROW(4);
-        RK_STORE_ROW(5);
-        RK_STORE_ROW(6);
-        RK_STORE_ROW(7);
-    } else {
-        RK_STORE_ROW(0);
-        RK_STORE_ROW(1);
-        RK_STORE_ROW(2);
-        RK_STORE_ROW(3);
-        RK_STORE_ROW(4);
-        RK_STORE_ROW(5);
-        RK_STORE_ROW(6);
-        RK_STORE_ROW(7);
-    }
+    RK_STORE_ROW(0);
+    RK_STORE_ROW(1);
+    RK_STORE_ROW(2);
+    RK_STORE_ROW(3);
+    RK_STORE_ROW(4);
+    RK_STORE_ROW(5);
+    RK_STORE_ROW(6);
+    RK_STORE_ROW(7);
 #undef RK_STORE_ROW
     (void)nmask;
 }
@@ -226,8 +241,10 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
 
         float *A_pack = NULL;
         float *B_pack = NULL;
+        __m512 *accs = NULL;
         int a_from_malloc = 0;
         int b_from_malloc = 0;
+        int accs_from_malloc = 0;
 
         if (arena != NULL) {
             barrage_err_t err = BARRAGE_OK;
@@ -247,11 +264,28 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
             B_pack = (float *)malloc((size_t)KC * NC * sizeof(float));
             b_from_malloc = 1;
         }
+        /* Per-thread accumulator slab. Holds the 8 zmm registers for
+         * every (ii, jj) micro-tile in the largest possible (mc, nc)
+         * block: (MC/MR) * (NC/NR) tiles * MR=8 zmm per tile. Sized
+         * for the worst case so we can reuse it across all (mc, nc)
+         * iterations without re-allocating. */
+        {
+            const size_t accs_bytes = (size_t)(MC / MR) * (NC / NR) * MR
+                                      * sizeof(__m512);
+            if (arena != NULL) {
+                barrage_err_t err = BARRAGE_OK;
+                accs = (__m512 *)barrage_alloc(arena, accs_bytes, 64, &err);
+            }
+            if (accs == NULL) {
+                accs = (__m512 *)malloc(accs_bytes);
+                accs_from_malloc = 1;
+            }
+        }
 
         /* If scratch allocation failed entirely we can't compute this
          * block; iterations are no-ops, leaving C zeroed. Graceful-degrade
          * path that never triggers for the bench/test shapes. */
-        if (A_pack != NULL && B_pack != NULL) {
+        if (A_pack != NULL && B_pack != NULL && accs != NULL) {
             #pragma omp for collapse(2) schedule(static)
             for (int mc = 0; mc < n_mc; ++mc) {
                 for (int nc = 0; nc < n_nc; ++nc) {
@@ -267,8 +301,22 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
                     const int mc_padded = ((mc_rows + MR - 1) / MR) * MR;
                     const int nc_padded = ((nc_cols + NR - 1) / NR) * NR;
 
-                    /* For each K block: pack A and B for this kc-step, then
-                     * run all micro-tiles in the (mc, nc, kc) sub-block. */
+                    /* Number of (MR, NR) micro-tiles in this (mc, nc)
+                     * block. Each tile owns 8 zmm accumulators in accs. */
+                    const int n_ii = (mc_rows + MR - 1) / MR;
+                    const int n_jj = (nc_cols + NR - 1) / NR;
+                    const size_t accs_bytes_block =
+                        (size_t)n_ii * (size_t)n_jj * MR * sizeof(__m512);
+
+                    /* Zero the accumulator slab for this block once.
+                     * Since rk_mm memset C to 0 above, this is equivalent
+                     * to "load C" for the first kc-step but skips the
+                     * per-kc-step C load+add+store round-trip. */
+                    memset(accs, 0, accs_bytes_block);
+
+                    /* kc-step loop stays outermost so packing A and B
+                     * once per kc-step is preserved. Each kc-step FMAs
+                     * into the SAME persistent accumulator slab. */
                     for (int kk = 0; kk < K; kk += KC) {
                         const int kc = (kk + KC <= K) ? KC : (K - kk);
 
@@ -279,16 +327,32 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
                                   nc_start, nc_cols,
                                   kk, kc);
 
+                        int tile_idx = 0;
                         for (int ii = 0; ii < mc_rows; ii += MR) {
                             for (int jj = 0; jj < nc_cols; jj += NR) {
-                                rk_microkernel(
+                                rk_microkernel_body(
                                     kc,
                                     A_pack + (size_t)ii * kc,
                                     B_pack + (size_t)jj,
                                     /*ldb=*/nc_padded,
+                                    &accs[(size_t)tile_idx * MR]);
+                                tile_idx++;
+                            }
+                        }
+                    }
+
+                    /* Single store pass: write the persistent
+                     * accumulators to C once after all kc-steps. */
+                    {
+                        int tile_idx = 0;
+                        for (int ii = 0; ii < mc_rows; ii += MR) {
+                            for (int jj = 0; jj < nc_cols; jj += NR) {
+                                rk_microkernel_store(
+                                    &accs[(size_t)tile_idx * MR],
                                     C, /*ldc=*/N,
                                     mc_start + ii, nc_start + jj,
                                     M, N);
+                                tile_idx++;
                             }
                         }
                     }
@@ -300,6 +364,7 @@ int rk_mm(const float *A, const float *B, float *C, int M, int K, int N)
          * barrage_reset; malloc'd memory is freed here. */
         if (a_from_malloc) free(A_pack);
         if (b_from_malloc) free(B_pack);
+        if (accs_from_malloc) free(accs);
     }
 
     return 0;
