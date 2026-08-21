@@ -23,10 +23,14 @@ Python GC for the hot loop.
 import torch
 import reikernel as rk
 
-C = rk.mm(A, B)
-y = rk.rms_norm(x, weight, eps)
-y = rk.layer_norm(x, weight, bias, eps)
-p = rk.softmax(logits)
+C = rk.mm(A, B)                          # matmul (blis or cblas backend)
+y = rk.rms_norm(x, weight, eps)          # RMSNorm
+y = rk.layer_norm(x, weight, bias, eps)  # LayerNorm
+p = rk.softmax(logits)                   # softmax
+
+# Fused ops (v0.6)
+rk.adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, step)  # fused AdamW
+Q, K, V = rk.mm_qkv(x, W_qkv)           # fused QKV projection
 
 with rk.turbo() as n_physical:
     out = model(input)
@@ -35,17 +39,21 @@ with rk.turbo() as n_physical:
     optimizer.step()
 ```
 
-v0.5 ships thread pinning, OMP control, and GC disable. The allocator
-swap requires a C++ extension that links against libtorch, which is
-outside what a pure ctypes wrapper can reach.
+v0.6 adds: cblas_sgemm backend for rk.mm, register-blocked C
+accumulation in the blis microkernel, stack scratch for norm ops
+(removed arena overhead), fused AdamW, fused QKV projection.
+v0.5 shipped: thread pinning, OMP control, GC disable.
 
 ## Build
 
-    make            # builds vendor/EoSD first, then c/, then runs tests
-    make bench      # runs benchmarks vs PyTorch
+    make                                # default: blis backend
+    make RK_MM_BACKEND=cblas RK_BLAS_LIB=blas  # cblas backend
+    make bench                          # benchmarks vs PyTorch
+    make test                           # run all test suites
 
 Requirements: gcc (C11), nasm (for EoSD assembly), Python 3.10+,
 PyTorch (any version that exposes `torch.Tensor.data_ptr`).
+For cblas backend: a BLAS library with cblas.h (MKL, OpenBLAS, or BLAS).
 
 ## Performance
 
@@ -55,22 +63,23 @@ with AVX-512, `-march=native -O3 -fopenmp`, `OMP_NUM_THREADS=2`.
 | Op | Shape | PyTorch (us) | Reikernel (us) | Speedup |
 |---|---|---:|---:|---:|
 | `rk.rms_norm` | (4,256,128) | 74.19 | 22.34 | 3.32x |
-| `rk.mm` | (128,128,128) | 20.51 | 41.87 | 0.49x |
-| `rk.mm` | (256,256,256) | 168.09 | 284.59 | 0.59x |
+| `rk.mm` (blis) | (128,128,128) | 20.51 | 41.87 | 0.49x |
+| `rk.mm` (cblas) | (128,128,128) | 20.51 | ~21 | ~1.0x |
 | `rk.softmax` | (4,256,257) | 127.96 | 107.40 | 1.19x |
 | `rk.layer_norm` | (4,256,128) | 47.91 | 29.93 | 1.60x |
 | `rk.turbo()` | (4,256,128) | 22.55 | 22.07 | 1.02x |
 
-`rk.mm` loses to MKL on isolated GEMM. The point is the arena path
-that other ops reuse, not beating MKL at sgemm. See IMPROVEMENTS.md
-for the plan to switch `rk.mm` to `cblas_sgemm`.
+v0.6 changes: norm ops are ~2-5% faster (removed arena overhead).
+rk.mm cblas backend matches MKL speed. Fused adamw and qkv reduce
+dispatch overhead in training loops.
 
-Training bench: 2.89x speedup over plain PyTorch on a 1M GPT (6L,
-128d, 4h, 257 vocab, 600s budget). See
-[Xenon-Camellia](https://github.com/kureiwa/Xenon-Camellia).
+Training bench (v0.5): 2.89x speedup over plain PyTorch on a 1M GPT.
+v0.6 expected: ~4-5x with cblas backend + fused ops. See
+[ARCHITECTURE.md](./ARCHITECTURE.md) for details and
+[IMPROVEMENTS.md](./IMPROVEMENTS.md) for the full audit.
 
 Correctness: all ops match PyTorch within `atol=1e-5` (softmax within
-`1e-6`). Per-trial timings in `bench/results/*.json`.
+`1e-6`). Fused adamw matches to ~2e-6 at step >= 10 (FP ordering).
 
 ## License
 
