@@ -25,10 +25,11 @@ __all__ = [
     "layer_norm",
     "turbo",
     "topo_detect",
+    "adamw_step",
     "load_library",
     "__version__",
 ]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ----------------------------------------------------------------------------
 # Shared library loading
@@ -158,6 +159,23 @@ def _configure_lib(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_uint),  # total_cpus
     ]
     v.restype = ctypes.c_int
+
+    # rk_adamw_step (v0.6)
+    aw = lib.rk_adamw_step
+    aw.argtypes = [
+        ctypes.c_void_p,  # params (in-place)
+        ctypes.c_void_p,  # grads
+        ctypes.c_void_p,  # exp_avg (in-place)
+        ctypes.c_void_p,  # exp_avg_sq (in-place)
+        ctypes.c_int,     # n
+        ctypes.c_float,   # lr
+        ctypes.c_float,   # beta1
+        ctypes.c_float,   # beta2
+        ctypes.c_float,   # eps
+        ctypes.c_float,   # weight_decay
+        ctypes.c_int,     # step
+    ]
+    aw.restype = ctypes.c_int
 
 
 # ----------------------------------------------------------------------------
@@ -704,6 +722,138 @@ def topo_detect() -> dict:
         "total_cpus":        total_cpus.value,
         "physical_cores":    n_physical,
     }
+
+
+# ----------------------------------------------------------------------------
+# adamw_step: fused AdamW optimizer step
+# ----------------------------------------------------------------------------
+
+def adamw_step(
+    params: torch.Tensor,
+    grads: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    lr: float,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+    step: int = 1,
+) -> None:
+    """Fused FP32 AdamW step (drop-in for one ``torch.optim.AdamW`` step
+    on a flat param vector).
+
+    Updates ``params``, ``exp_avg``, and ``exp_avg_sq`` in place:
+
+        m = beta1 * m + (1 - beta1) * grad
+        v = beta2 * v + (1 - beta2) * grad^2
+        denom = sqrt(v) / sqrt(1 - beta2^step) + eps
+        p = p * (1 - lr * wd) - (lr / (1 - beta1^step)) * m / denom
+
+    Single pass over the param vector, AVX-512 vectorised in C. Decoupled
+    weight decay, biased first/second moments, bias-corrected step size.
+    Matches ``torch.optim.AdamW`` numerics.
+
+    Args:
+        params:      FP32 contiguous 1D tensor, updated in place.
+        grads:       FP32 contiguous 1D tensor, same length as params.
+        exp_avg:     FP32 contiguous 1D tensor (first moment), updated
+                     in place, same length as params.
+        exp_avg_sq:  FP32 contiguous 1D tensor (second moment), updated
+                     in place, same length as params.
+        lr:          Learning rate (>= 0).
+        beta1:       First moment decay rate in [0, 1) (default 0.9).
+        beta2:       Second moment decay rate in [0, 1) (default 0.999).
+        eps:         Denom stabiliser (>= 0, default 1e-8).
+        weight_decay: Decoupled weight decay (>= 0, default 0.0).
+        step:        1-indexed step number for bias correction (>= 1).
+
+    Raises:
+        TypeError:  if any tensor is not a torch.Tensor.
+        ValueError: if dtype != float32, not contiguous, not 1D, length
+                    mismatch, or any hyperparameter is out of range.
+        RuntimeError: if rk_adamw_step returns non-zero.
+    """
+    # --- type checks ---
+    for name, t in (("params", params), ("grads", grads),
+                    ("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(
+                f"{name} must be torch.Tensor, got {type(t).__name__}"
+            )
+
+    # --- dtype checks ---
+    for name, t in (("params", params), ("grads", grads),
+                    ("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+        if t.dtype != torch.float32:
+            raise ValueError(
+                f"{name}.dtype must be torch.float32, got {t.dtype}"
+            )
+
+    # --- contiguity checks ---
+    for name, t in (("params", params), ("grads", grads),
+                    ("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+        if not t.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous. Call {name} = "
+                f"{name}.contiguous() before adamw_step."
+            )
+
+    # --- rank checks ---
+    for name, t in (("params", params), ("grads", grads),
+                    ("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+        if t.dim() != 1:
+            raise ValueError(
+                f"{name} must be 1D (n,); got {t.dim()}D with shape "
+                f"{tuple(t.shape)}"
+            )
+
+    # --- length match ---
+    n = params.shape[0]
+    for name, t in (("grads", grads), ("exp_avg", exp_avg),
+                    ("exp_avg_sq", exp_avg_sq)):
+        if t.shape[0] != n:
+            raise ValueError(
+                f"{name}.shape[0] ({t.shape[0]}) must match "
+                f"params.shape[0] ({n})"
+            )
+
+    # --- hyperparameter validation ---
+    if lr < 0:
+        raise ValueError(f"lr must be non-negative, got {lr}")
+    if not (0.0 <= beta1 < 1.0):
+        raise ValueError(f"beta1 must be in [0, 1), got {beta1}")
+    if not (0.0 <= beta2 < 1.0):
+        raise ValueError(f"beta2 must be in [0, 1), got {beta2}")
+    if eps < 0:
+        raise ValueError(f"eps must be non-negative, got {eps}")
+    if weight_decay < 0:
+        raise ValueError(
+            f"weight_decay must be non-negative, got {weight_decay}"
+        )
+    if step < 1:
+        raise ValueError(f"step must be >= 1, got {step}")
+
+    # --- call C ---
+    lib = load_library()
+    rc = lib.rk_adamw_step(
+        ctypes.c_void_p(params.data_ptr()),
+        ctypes.c_void_p(grads.data_ptr()),
+        ctypes.c_void_p(exp_avg.data_ptr()),
+        ctypes.c_void_p(exp_avg_sq.data_ptr()),
+        ctypes.c_int(n),
+        ctypes.c_float(lr),
+        ctypes.c_float(beta1),
+        ctypes.c_float(beta2),
+        ctypes.c_float(eps),
+        ctypes.c_float(weight_decay),
+        ctypes.c_int(step),
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"rk_adamw_step returned error code {rc} "
+            "(NULL pointer, bad shape, or integer overflow)."
+        )
 
 
 # ----------------------------------------------------------------------------

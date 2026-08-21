@@ -77,6 +77,34 @@ int rk_topo_detect(unsigned *threads_per_core,
                    unsigned *num_numa_nodes,
                    unsigned *total_cpus);
 
+/* rk_adamw_step: fused FP32 AdamW optimizer step (drop-in for one
+ * torch.optim.AdamW step on a flat param vector).
+ *
+ *   m = beta1 * m + (1 - beta1) * grad
+ *   v = beta2 * v + (1 - beta2) * grad^2
+ *   denom = sqrt(v) / sqrt(1 - beta2^step) + eps
+ *   p = p * (1 - lr * wd) - (lr / (1 - beta1^step)) * m / denom
+ *
+ * Single pass over the param vector, AVX-512 vectorised when
+ * __AVX512F__. Decoupled weight decay, biased first/second moments,
+ * bias-corrected step size. Matches torch.optim.AdamW numerics.
+ *
+ * Args:
+ *   params, grads, exp_avg, exp_avg_sq: FP32 contiguous, length n.
+ *     params, exp_avg, exp_avg_sq are updated in place.
+ *   n:           element count (>= 1).
+ *   lr:          learning rate (>= 0).
+ *   beta1, beta2: Adam moment decay rates in [0, 1).
+ *   eps:         denom stabiliser (>= 0).
+ *   weight_decay: decoupled weight decay (>= 0).
+ *   step:        1-indexed step number used for bias correction (>= 1).
+ *
+ * Returns 0 on success, -1 on bad input. */
+int rk_adamw_step(float *params, const float *grads,
+                  float *exp_avg, float *exp_avg_sq,
+                  int n, float lr, float beta1, float beta2,
+                  float eps, float weight_decay, int step);
+
 #ifdef __cplusplus
 }
 #endif
