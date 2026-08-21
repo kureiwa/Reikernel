@@ -105,6 +105,26 @@ int rk_adamw_step(float *params, const float *grads,
                   int n, float lr, float beta1, float beta2,
                   float eps, float weight_decay, int step);
 
+/* rk_mm_qkv: fused QKV projection.
+ *   Q = x @ W_q, K = x @ W_k, V = x @ W_v
+ * where W_qkv is a pre-stacked (3, C, C) tensor with W_q at [0],
+ * W_k at [1], W_v at [2]. Single C call saves two Python -> C dispatch
+ * round-trips per layer vs three separate rk_mm calls. The underlying
+ * matmul reuses rk_mm (blis or cblas backend, compile-time selected).
+ *
+ * Args:
+ *   x:      FP32 contiguous, shape (M, C).
+ *   W_qkv:  FP32 contiguous, shape (3, C, C). Row-major.
+ *   Q, K, V: FP32 contiguous output buffers, each shape (M, C). May be
+ *            NULL only when M == 0 or C == 0 (no-op).
+ *   M, C:   dimensions (>= 0).
+ *
+ * Returns 0 on success, -1 on bad input or if any of the three rk_mm
+ * calls fails. */
+int rk_mm_qkv(const float *x, const float *W_qkv,
+              float *Q, float *K, float *V,
+              int M, int C);
+
 #ifdef __cplusplus
 }
 #endif

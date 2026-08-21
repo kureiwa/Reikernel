@@ -21,6 +21,7 @@ import torch
 __all__ = [
     "rms_norm",
     "mm",
+    "mm_qkv",
     "softmax",
     "layer_norm",
     "turbo",
@@ -176,6 +177,19 @@ def _configure_lib(lib: ctypes.CDLL) -> None:
         ctypes.c_int,     # step
     ]
     aw.restype = ctypes.c_int
+
+    # rk_mm_qkv (v0.6)
+    qkv = lib.rk_mm_qkv
+    qkv.argtypes = [
+        ctypes.c_void_p,  # x
+        ctypes.c_void_p,  # W_qkv
+        ctypes.c_void_p,  # Q (out)
+        ctypes.c_void_p,  # K (out)
+        ctypes.c_void_p,  # V (out)
+        ctypes.c_int,     # M
+        ctypes.c_int,     # C
+    ]
+    qkv.restype = ctypes.c_int
 
 
 # ----------------------------------------------------------------------------
@@ -376,6 +390,123 @@ def mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             "(NULL pointer, bad shape, or integer overflow)."
         )
     return C
+
+
+# ----------------------------------------------------------------------------
+# mm_qkv (fused QKV projection)
+# ----------------------------------------------------------------------------
+
+def mm_qkv(
+    x: torch.Tensor,
+    W_qkv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused QKV projection.
+
+    Computes ``Q = x @ W_q``, ``K = x @ W_k``, ``V = x @ W_v`` in a
+    single C call, where ``W_qkv`` is a pre-stacked ``(3, C, C)`` tensor
+    with ``W_qkv[0] = W_q``, ``W_qkv[1] = W_k``, ``W_qkv[2] = W_v``.
+    Saves two Python -> C dispatch round-trips per layer vs three
+    separate ``rk.mm`` calls. The user stacks the three weight matrices
+    once at model init.
+
+    Args:
+        x:     FP32 contiguous 2D tensor ``(M, C)``.
+        W_qkv: FP32 contiguous 3D tensor ``(3, C, C)``. Row-major.
+
+    Returns:
+        Tuple ``(Q, K, V)`` of FP32 contiguous 2D tensors, each
+        shape ``(M, C)``.
+
+    Raises:
+        TypeError:  if x or W_qkv is not a torch.Tensor.
+        ValueError: if dtype != float32, not contiguous, wrong rank,
+                    or shape mismatch.
+        RuntimeError: if rk_mm_qkv returns non-zero.
+    """
+    # --- type checks ---
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"x must be torch.Tensor, got {type(x).__name__}")
+    if not isinstance(W_qkv, torch.Tensor):
+        raise TypeError(
+            f"W_qkv must be torch.Tensor, got {type(W_qkv).__name__}"
+        )
+
+    # --- dtype checks ---
+    if x.dtype != torch.float32:
+        raise ValueError(f"x.dtype must be torch.float32, got {x.dtype}")
+    if W_qkv.dtype != torch.float32:
+        raise ValueError(
+            f"W_qkv.dtype must be torch.float32, got {W_qkv.dtype}"
+        )
+
+    # --- contiguity checks ---
+    if not x.is_contiguous():
+        raise ValueError(
+            "x must be contiguous. Call x = x.contiguous() before mm_qkv."
+        )
+    if not W_qkv.is_contiguous():
+        raise ValueError(
+            "W_qkv must be contiguous. Call W_qkv = W_qkv.contiguous() "
+            "before mm_qkv."
+        )
+
+    # --- rank checks ---
+    if x.dim() != 2:
+        raise ValueError(
+            f"x must be 2D (M, C); got {x.dim()}D with shape {tuple(x.shape)}"
+        )
+    if W_qkv.dim() != 3:
+        raise ValueError(
+            f"W_qkv must be 3D (3, C, C); got {W_qkv.dim()}D with shape "
+            f"{tuple(W_qkv.shape)}"
+        )
+
+    # --- shape match ---
+    M, C_x = x.shape[0], x.shape[1]
+    n_stack, C_w, C_w2 = W_qkv.shape[0], W_qkv.shape[1], W_qkv.shape[2]
+    if n_stack != 3:
+        raise ValueError(
+            f"W_qkv.shape[0] must be 3 (stacked W_q, W_k, W_v); got "
+            f"{n_stack}"
+        )
+    if C_w != C_w2:
+        raise ValueError(
+            f"W_qkv must be (3, C, C) with C == C; got "
+            f"W_qkv.shape[1]={C_w}, W_qkv.shape[2]={C_w2}"
+        )
+    if C_x != C_w:
+        raise ValueError(
+            f"x.shape[1] ({C_x}) must match W_qkv.shape[1] ({C_w}) for "
+            f"matmul; got x={tuple(x.shape)} W_qkv={tuple(W_qkv.shape)}"
+        )
+    C = C_x
+
+    # --- allocate outputs ---
+    Q = torch.empty((M, C), dtype=torch.float32)
+    K = torch.empty((M, C), dtype=torch.float32)
+    V = torch.empty((M, C), dtype=torch.float32)
+
+    # --- degenerate shapes: M=0 or C=0 means empty output, no work. ---
+    if M == 0 or C == 0:
+        return Q, K, V
+
+    # --- call C ---
+    lib = load_library()
+    rc = lib.rk_mm_qkv(
+        ctypes.c_void_p(x.data_ptr()),
+        ctypes.c_void_p(W_qkv.data_ptr()),
+        ctypes.c_void_p(Q.data_ptr()),
+        ctypes.c_void_p(K.data_ptr()),
+        ctypes.c_void_p(V.data_ptr()),
+        ctypes.c_int(M),
+        ctypes.c_int(C),
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"rk_mm_qkv returned error code {rc} "
+            "(NULL pointer, bad shape, or integer overflow)."
+        )
+    return Q, K, V
 
 
 # ----------------------------------------------------------------------------
