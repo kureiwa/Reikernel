@@ -1,8 +1,16 @@
 /* rk_norm.c -- RMSNorm, FP32, (B,T,C).
  * y = x / sqrt(mean(x^2) + eps) * weight.
- * OpenMP collapse(2) over (B,T); per-thread libbarrage arena holds the
- * per-row sum-of-squares scratch. Math matches PyTorch's fp32 CPU path
+ * OpenMP collapse(2) over (B,T); per-row sum-of-squares lives on the
+ * stack (8 bytes, always L1). Math matches PyTorch's fp32 CPU path
  * (true divide, no -ffast-math, no inv_rms precompute).
+ *
+ * v0.6: removed the per-thread libbarrage arena. The arena was
+ * bump-allocating 4 bytes per row and never reset (the "keep the bump
+ * pointer warm" comment was inverted), so it filled after ~1024 calls
+ * and silently fell back to the stack scratch anyway. The arena added
+ * TLS lookup + barrage_alloc + error-out-param overhead per row for
+ * zero benefit. The matmul op still uses the arena (large packed
+ * panels); the norm ops don't.
  */
 
 #include "rk_api.h"
@@ -10,30 +18,6 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "barrage.h"
-
-/* Per-thread libbarrage arena. 4 MiB, mmap-backed, lazily created, never
- * destroyed. Falls back to stack scratch if barrage_create fails. */
-#define RK_ARENA_BYTES (4u * 1024u * 1024u)
-
-static barrage_arena_t *rk_get_thread_arena(void)
-{
-    static __thread barrage_arena_t *arena = NULL;
-    if (arena == NULL) {
-        arena = barrage_create(RK_ARENA_BYTES, NULL);
-        /* If barrage_create fails (out of address space / mmap denied) the
-         * caller falls back to a stack scratch. Don't crash the kernel. */
-    }
-    return arena;
-}
-
-/* Fallback scratch on the stack if the arena is unavailable. Tiny, only
- * used to hold the per-row scalar sum. */
-static float rk_stack_scratch(void)
-{
-    return 0.0f;
-}
 
 int rk_rms_norm(const float *x, const float *weight, float *y,
                 int B, int T, int C, float eps)
@@ -47,10 +31,6 @@ int rk_rms_norm(const float *x, const float *weight, float *y,
     if ((int64_t)B * (int64_t)T > (int64_t)INT32_MAX / (int64_t)C) return -1;
 
     const int C_f = C;                 /* C as int (already validated) */
-    const long bt = (long)B * (long)T; /* row count */
-
-    /* Prime the calling thread's arena TLS slot. */
-    (void)rk_get_thread_arena();
 
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b = 0; b < B; ++b) {
@@ -58,17 +38,11 @@ int rk_rms_norm(const float *x, const float *weight, float *y,
             const float *xb = x + (((long)b * (long)T + (long)t) * (long)C_f);
             float       *yb = y + (((long)b * (long)T + (long)t) * (long)C_f);
 
-            /* Per-row scratch from the arena; falls back to stack if NULL. */
-            barrage_arena_t *arena = rk_get_thread_arena();
-            float *pscratch = NULL;
-            if (arena != NULL) {
-                barrage_err_t err = BARRAGE_OK;
-                pscratch = (float *)barrage_alloc(arena, sizeof(float),
-                                                 _Alignof(float), &err);
-            }
-            float stack_v = rk_stack_scratch();
-            if (pscratch == NULL) pscratch = &stack_v;
-            *pscratch = 0.0f;
+            /* Per-row sum-of-squares on the stack. 4 bytes, always L1.
+             * Replaces the v0.5 barrage_alloc + TLS lookup + fallback
+             * path that the audit (IMPROVEMENTS.md B2) flagged as net
+             * negative. */
+            float row_scratch[1] = { 0.0f };
 
             /* Sum of x^2 across the row. omp simd reduction vectorises
              * along C; PyTorch does the same. */
@@ -78,11 +52,11 @@ int rk_rms_norm(const float *x, const float *weight, float *y,
                 const float xi = xb[i];
                 sum += xi * xi;
             }
-            *pscratch = sum;
+            row_scratch[0] = sum;
 
             /* PyTorch fp32 path: mean = sum/C, rms = sqrtf(mean+eps),
              * y = (x*weight)/rms. No inv_rms precompute, no -ffast-math. */
-            const float mean = (*pscratch) / (float)C_f;
+            const float mean = row_scratch[0] / (float)C_f;
             const float rms  = sqrtf(mean + eps);
 
             /* FMA for (x*weight) only adds precision to the numerator. */
@@ -92,9 +66,6 @@ int rk_rms_norm(const float *x, const float *weight, float *y,
             }
         }
     }
-
-    /* Don't reset; keep the bump pointer warm for the next call. */
-    (void)bt;
 
     return 0;
 }

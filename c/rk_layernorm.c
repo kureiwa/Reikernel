@@ -2,9 +2,14 @@
  * Two-pass per row: sum -> mean, sum((x-mean)^2) -> var -> rstd, then
  * normalize+scale+shift. rstd is computed once per row and multiplied
  * in (matches PyTorch's CPU kernel ordering, not per-element divide like
- * rk_rms_norm). Per-thread libbarrage arena for the per-row mean+rstd
- * scratch. No -ffast-math; the (x-mean)*rstd*weight+bias chain fuses to
+ * rk_rms_norm). Per-row mean+rstd lives on the stack (8 bytes, always
+ * L1). No -ffast-math; the (x-mean)*rstd*weight+bias chain fuses to
  * 2 FMAs at -O3.
+ *
+ * v0.6: removed the per-thread libbarrage arena. The arena was
+ * bump-allocating 8 bytes per row and never reset, so it filled after
+ * ~500 calls and fell back to the stack scratch anyway. The matmul op
+ * still uses the arena (large packed panels); the norm ops don't.
  */
 
 #include "rk_api.h"
@@ -12,22 +17,6 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-
-#include "barrage.h"
-
-/* Per-thread libbarrage arena. 4 MiB, mmap-backed, lazily created, never
- * destroyed. Falls back to stack scratch if barrage_create fails. */
-#define RK_ARENA_BYTES (4u * 1024u * 1024u)
-
-static barrage_arena_t *rk_get_thread_arena(void)
-{
-    static __thread barrage_arena_t *arena = NULL;
-    if (arena == NULL) {
-        arena = barrage_create(RK_ARENA_BYTES, NULL);
-        /* If barrage_create fails, caller falls back to a stack scratch. */
-    }
-    return arena;
-}
 
 int rk_layer_norm(const float *x, const float *weight, const float *bias,
                   float *y, int B, int T, int C, float eps)
@@ -43,26 +32,17 @@ int rk_layer_norm(const float *x, const float *weight, const float *bias,
 
     const int C_f = C;                 /* C as int (already validated) */
 
-    /* Prime the calling thread's arena TLS slot. */
-    (void)rk_get_thread_arena();
-
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b = 0; b < B; ++b) {
         for (int t = 0; t < T; ++t) {
             const float *xb = x + (((long)b * (long)T + (long)t) * (long)C_f);
             float       *yb = y + (((long)b * (long)T + (long)t) * (long)C_f);
 
-            /* Per-row mean+rstd scratch from the arena; falls back to stack. */
-            barrage_arena_t *arena = rk_get_thread_arena();
-            float *pscratch = NULL;
-            if (arena != NULL) {
-                barrage_err_t err = BARRAGE_OK;
-                pscratch = (float *)barrage_alloc(arena,
-                                                  2u * sizeof(float),
-                                                  _Alignof(float), &err);
-            }
-            float stack_scratch[2] = { 0.0f, 0.0f };
-            if (pscratch == NULL) pscratch = stack_scratch;
+            /* Per-row mean+rstd scratch on the stack. 8 bytes, always L1.
+             * Replaces the v0.5 barrage_alloc + TLS lookup + fallback
+             * path that the audit (IMPROVEMENTS.md B2) flagged as net
+             * negative. Holds [mean, rstd]. */
+            float row_scratch[2] = { 0.0f, 0.0f };
 
             /* --- Pass 1: per-row sum -> mean --- */
             float sum = 0.0f;
@@ -71,40 +51,41 @@ int rk_layer_norm(const float *x, const float *weight, const float *bias,
                 sum += xb[i];
             }
             const float mean = sum / (float)C_f;
-            pscratch[0] = mean;
+            row_scratch[0] = mean;
 
             /* --- Pass 2: per-row sum of (x - mean)^2 -> var -> rstd.
              * Row is hot in L1 after pass 1, so the second read is cheap. */
+            const float row_mean = row_scratch[0];
             float sum_sq = 0.0f;
             #pragma omp simd reduction(+:sum_sq)
             for (int i = 0; i < C_f; ++i) {
-                const float d = xb[i] - mean;
+                const float d = xb[i] - row_mean;
                 sum_sq += d * d;
             }
             const float var  = sum_sq / (float)C_f;
             /* rstd = 1 / sqrt(var + eps). Computed once per row and
              * multiplied in (matches PyTorch's CPU kernel ordering). */
             const float rstd = 1.0f / sqrtf(var + eps);
-            pscratch[1] = rstd;
+            row_scratch[1] = rstd;
 
             /* --- Pass 3: per-element normalize + scale + shift.
              * y[i] = (x[i] - mean) * rstd * weight[i] + bias[i]
              * Fuses to 2 FMAs at -O3. When bias is NULL, drop the +bias
              * term (matches F.layer_norm with bias=None). */
+            const float row_rstd = row_scratch[1];
             if (bias != NULL) {
                 #pragma omp simd
                 for (int i = 0; i < C_f; ++i) {
-                    yb[i] = (xb[i] - mean) * rstd * weight[i] + bias[i];
+                    yb[i] = (xb[i] - row_mean) * row_rstd * weight[i] + bias[i];
                 }
             } else {
                 #pragma omp simd
                 for (int i = 0; i < C_f; ++i) {
-                    yb[i] = (xb[i] - mean) * rstd * weight[i];
+                    yb[i] = (xb[i] - row_mean) * row_rstd * weight[i];
                 }
             }
         }
     }
 
-    /* Don't reset; keep the bump pointer warm for the next call. */
     return 0;
 }

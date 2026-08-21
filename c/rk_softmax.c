@@ -2,6 +2,11 @@
  * Three passes per row: max, exp+sum, divide. AVX-512 polynomial exp
  * (Cody-Waite + degree-6 Taylor) when __AVX512F__ is set; scalar expf
  * otherwise. Math matches PyTorch's softmax_lastdim CPU kernel.
+ *
+ * v0.6: removed the per-thread libbarrage arena. The arena was
+ * bump-allocating 8 bytes per row and never reset, so it filled after
+ * ~500 calls and fell back to the stack scratch anyway. The matmul op
+ * still uses the arena (large packed panels); the norm ops don't.
  */
 
 #include "rk_api.h"
@@ -10,28 +15,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "barrage.h"
-
 #ifdef __AVX512F__
 #include <immintrin.h>
 #define RK_HAS_AVX512 1
 #else
 #define RK_HAS_AVX512 0
 #endif
-
-/* Per-thread libbarrage arena. 4 MiB, mmap-backed, lazily created, never
- * destroyed. Falls back to stack scratch if barrage_create fails. */
-#define RK_ARENA_BYTES (4u * 1024u * 1024u)
-
-static barrage_arena_t *rk_get_thread_arena(void)
-{
-    static __thread barrage_arena_t *arena = NULL;
-    if (arena == NULL) {
-        arena = barrage_create(RK_ARENA_BYTES, NULL);
-        /* If barrage_create fails, caller falls back to a stack scratch. */
-    }
-    return arena;
-}
 
 #if RK_HAS_AVX512
 /* rk_exp512_ps: AVX-512 polynomial exp for 16 FP32 lanes.
@@ -102,26 +91,17 @@ int rk_softmax(const float *x, float *y, int B, int T, int V)
 
     const int V_f = V;                 /* V as int (already validated) */
 
-    /* Prime the calling thread's arena TLS slot. */
-    (void)rk_get_thread_arena();
-
     #pragma omp parallel for collapse(2) schedule(static)
     for (int b = 0; b < B; ++b) {
         for (int t = 0; t < T; ++t) {
             const float *xb = x + (((long)b * (long)T + (long)t) * (long)V_f);
             float       *yb = y + (((long)b * (long)T + (long)t) * (long)V_f);
 
-            /* Per-row max+sum scratch from the arena; falls back to stack. */
-            barrage_arena_t *arena = rk_get_thread_arena();
-            float *pscratch = NULL;
-            if (arena != NULL) {
-                barrage_err_t err = BARRAGE_OK;
-                pscratch = (float *)barrage_alloc(arena,
-                                                  2u * sizeof(float),
-                                                  _Alignof(float), &err);
-            }
-            float stack_scratch[2] = { 0.0f, 0.0f };
-            if (pscratch == NULL) pscratch = stack_scratch;
+            /* Per-row max+sum scratch on the stack. 8 bytes, always L1.
+             * Replaces the v0.5 barrage_alloc + TLS lookup + fallback
+             * path that the audit (IMPROVEMENTS.md B2) flagged as net
+             * negative. Holds [max, sum]. */
+            float row_scratch[2] = { 0.0f, 0.0f };
 
             /* --- Pass 1: per-row max (numerically-stable anchor m) --- */
             float m;
@@ -148,16 +128,17 @@ int rk_softmax(const float *x, float *y, int B, int T, int V)
                 m = (xb[i] > m) ? xb[i] : m;
             }
 #endif
-            pscratch[0] = m;
+            row_scratch[0] = m;
 
             /* --- Pass 2: compute y[i] = exp(x[i] - m), accumulate sum s. --- */
+            const float row_max = row_scratch[0];
             float s = 0.0f;
             int i = 0;
 #if RK_HAS_AVX512
             {
                 /* AVX-512 vectorised path: 16 floats per iter via the
                  * rk_exp512_ps polynomial approximation. */
-                const __m512 mv = _mm512_set1_ps(m);
+                const __m512 mv = _mm512_set1_ps(row_max);
                 __m512 sv = _mm512_setzero_ps();
                 for (; i + 16 <= V_f; i += 16) {
                     const __m512 xv      = _mm512_loadu_ps(xb + i);
@@ -175,35 +156,35 @@ int rk_softmax(const float *x, float *y, int B, int T, int V)
             #pragma omp simd reduction(+:s)
             #endif
             for (; i < V_f; ++i) {
-                const float e = expf(xb[i] - m);
+                const float e = expf(xb[i] - row_max);
                 yb[i] = e;
                 s += e;
             }
-            pscratch[1] = s;
+            row_scratch[1] = s;
 
             /* --- Pass 3: normalise by sum (per-element divide). --- */
+            const float row_sum = row_scratch[1];
 #if RK_HAS_AVX512
             {
-                const __m512 sv_v = _mm512_set1_ps(s);
+                const __m512 sv_v = _mm512_set1_ps(row_sum);
                 int j = 0;
                 for (; j + 16 <= V_f; j += 16) {
                     const __m512 yv = _mm512_loadu_ps(yb + j);
                     _mm512_storeu_ps(yb + j, _mm512_div_ps(yv, sv_v));
                 }
                 for (; j < V_f; ++j) {
-                    yb[j] = yb[j] / s;
+                    yb[j] = yb[j] / row_sum;
                 }
             }
 #else
             /* Scalar fallback path. OpenMP omp simd vectorises with AVX2. */
             #pragma omp simd
             for (int j = 0; j < V_f; ++j) {
-                yb[j] = yb[j] / s;
+                yb[j] = yb[j] / row_sum;
             }
 #endif
         }
     }
 
-    /* Don't reset; keep the bump pointer warm for the next call. */
     return 0;
 }
