@@ -60,9 +60,17 @@ static ssize_t rk_read_sysfs(const char *path, char *buf, size_t bufsz)
 }
 
 /* Parse a cpulist string like "0-1,3,5-7" into `out` (an array of CPU IDs).
- * Writes at most max_out IDs. Returns the number of IDs parsed (may exceed
- * max_out; in that case the caller knows truncation occurred). Returns -1
- * on parse error. */
+ * Writes at most max_out IDs. Returns the number of IDs written (clamped
+ * to max_out so the caller can iterate [0, n) without over-reading `out`).
+ * Returns -1 on parse error.
+ *
+ * v0.6: clamps the return value to max_out. The previous version
+ * returned the true parse count even when it exceeded max_out, so the
+ * only caller (rk_build_physical_mask) read siblings[i] for i in
+ * [0, n) past the 256-entry stack buffer on boxes with > 256 siblings
+ * per core (e.g. a 1024-thread SMT-8 vNuma node). The sandbox has 2
+ * CPUs so this never fired, but it was a latent over-read
+ * (IMPROVEMENTS.md B1). */
 static int rk_parse_cpulist(const char *s, unsigned *out, unsigned max_out)
 {
     unsigned count = 0;
@@ -96,6 +104,11 @@ static int rk_parse_cpulist(const char *s, unsigned *out, unsigned max_out)
 
         while (*p == ' ' || *p == '\t') p++;
     }
+    /* Clamp to max_out so the caller's `for (i = 0; i < n; i++)` loop
+     * never reads past out[max_out-1]. Truncation is fine here: we only
+     * need the minimum CPU id in the sibling list, and a truncated list
+     * still contains a valid (if not global) minimum. */
+    if (count > max_out) count = max_out;
     return (int)count;
 }
 
