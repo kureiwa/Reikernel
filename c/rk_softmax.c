@@ -7,6 +7,12 @@
  * bump-allocating 8 bytes per row and never reset, so it filled after
  * ~500 calls and fell back to the stack scratch anyway. The matmul op
  * still uses the arena (large packed panels); the norm ops don't.
+ *
+ * v0.6: renamed log2_hi_v / log2_lo_v to ln2_hi_v / ln2_lo_v in
+ * rk_exp512_ps. The constants are ln(2) (natural log of 2), not
+ * log2(2)=1; the old names invited a future maintainer to "fix" them
+ * and break the Cody-Waite reduction. Math unchanged
+ * (IMPROVEMENTS.md B3).
  */
 
 #include "rk_api.h"
@@ -29,8 +35,8 @@
 static inline __m512 rk_exp512_ps(__m512 xv)
 {
     const __m512 inv_log2_v = _mm512_set1_ps(1.4426950408889634f);
-    const __m512 log2_hi_v  = _mm512_set1_ps(0.693145751953125f);
-    const __m512 log2_lo_v  = _mm512_set1_ps(1.4286067653301870e-6f);
+    const __m512 ln2_hi_v   = _mm512_set1_ps(0.693145751953125f);
+    const __m512 ln2_lo_v   = _mm512_set1_ps(1.4286067653301870e-6f);
 
     /* n = round(x * inv_log2) via add-copysign(0.5)-then-truncate (gcc's
      * <immintrin.h> doesn't expose _mm512_round_ps directly). The Cody-
@@ -44,10 +50,10 @@ static inline __m512 rk_exp512_ps(__m512 xv)
     const __m512i n_int     = _mm512_cvttps_epi32(nv);
     const __m512  n_float   = _mm512_cvtepi32_ps(n_int);
 
-    /* r = x - n * log2_hi - n * log2_lo (Cody-Waite split-constant reduction).
+    /* r = x - n * ln2_hi - n * ln2_lo (Cody-Waite split-constant reduction).
      * _mm512_fnmadd_ps(a, b, c) = c - a*b. */
-    __m512 r = _mm512_fnmadd_ps(n_float, log2_hi_v, xv);  /* r = xv - n*log2_hi */
-    r = _mm512_fnmadd_ps(n_float, log2_lo_v, r);          /* r = r  - n*log2_lo */
+    __m512 r = _mm512_fnmadd_ps(n_float, ln2_hi_v, xv);  /* r = xv - n*ln2_hi */
+    r = _mm512_fnmadd_ps(n_float, ln2_lo_v, r);          /* r = r  - n*ln2_lo */
 
     /* Degree-6 Taylor polynomial via Horner's scheme:
      *   poly = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120 + r*1/720))))) */
